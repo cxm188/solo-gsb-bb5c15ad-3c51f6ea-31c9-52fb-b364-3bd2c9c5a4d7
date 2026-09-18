@@ -15,6 +15,7 @@ from .negotiation import (
     AcceptSyntaxError,
     AcceptRange,
     SPECIFICITY_NAMES,
+    audit_accept,
     negotiate,
 )
 
@@ -24,14 +25,14 @@ logger = logging.getLogger("content-negotiation")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 容器启动初始化：仅记录就绪日志；依赖安装已在镜像构建阶段完成。
-    logger.info("内容协商调试服务已就绪：POST /negotiate")
+    logger.info("内容协商调试服务已就绪：POST /negotiate, POST /audit-accept")
     yield
     logger.info("内容协商调试服务关闭")
 
 
 app = FastAPI(
     title="HTTP 内容协商调试器",
-    description="调试 Accept 头与候选表示之间的匹配、q 值与排序过程。",
+    description="调试 Accept 头与候选表示之间的匹配、q 值与排序过程；支持静态审计。",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -65,6 +66,38 @@ class NegotiateResponse(BaseModel):
     parsed_accept: list[dict]
 
 
+class RangeHitOut(BaseModel):
+    index: int
+    range: str
+    q: float
+    specificity: int
+    specificity_name: str
+    effective: bool
+
+
+class ConflictOut(BaseModel):
+    specificity: int
+    specificity_name: str
+    ranges: list[dict]
+
+
+class AuditCandidateOut(BaseModel):
+    index: int
+    media_type: str
+    server_priority: float
+    eligible: bool
+    eliminated_reason: str | None
+    effective_range: dict | None
+    matched_ranges: list[RangeHitOut]
+    conflicts: list[ConflictOut]
+
+
+class AuditResponse(BaseModel):
+    candidates: list[AuditCandidateOut]
+    shadowed: list[dict]
+    parsed_accept: list[dict]
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str
@@ -91,7 +124,7 @@ async def root() -> dict:
     return {
         "service": "http-content-negotiation-debugger",
         "docs": "/docs",
-        "endpoint": "POST /negotiate",
+        "endpoints": ["POST /negotiate", "POST /audit-accept"],
     }
 
 
@@ -112,6 +145,16 @@ def _accept_to_dict(r: AcceptRange) -> dict:
     }
 
 
+def _validate_candidates(payload: NegotiateRequest) -> JSONResponse | None:
+    # 业务层校验：候选列表不能为空，server_priority 必须为有限数。
+    if not payload.candidates:
+        return _bad_request("candidates 不能为空")
+    for i, cand in enumerate(payload.candidates):
+        if not math.isfinite(cand.server_priority):
+            return _bad_request(f"candidates[{i}].server_priority 必须是有限数")
+    return None
+
+
 @app.post(
     "/negotiate",
     response_model=NegotiateResponse,
@@ -121,12 +164,9 @@ def _accept_to_dict(r: AcceptRange) -> dict:
     },
 )
 async def do_negotiate(payload: NegotiateRequest):
-    # 业务层校验：候选列表不能为空，server_priority 必须为有限数。
-    if not payload.candidates:
-        return _bad_request("candidates 不能为空")
-    for i, cand in enumerate(payload.candidates):
-        if not math.isfinite(cand.server_priority):
-            return _bad_request(f"candidates[{i}].server_priority 必须是有限数")
+    invalid = _validate_candidates(payload)
+    if invalid is not None:
+        return invalid
 
     raw_candidates = [(c.media_type, c.server_priority) for c in payload.candidates]
     try:
@@ -164,3 +204,43 @@ async def do_negotiate(payload: NegotiateRequest):
         "candidates": candidate_payload,
         "parsed_accept": [_accept_to_dict(r) for r in accept_ranges],
     }
+
+
+@app.post(
+    "/audit-accept",
+    response_model=AuditResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Accept 头或候选非法"},
+        406: {"model": ErrorResponse, "description": "无可用候选表示"},
+    },
+)
+async def do_audit_accept(payload: NegotiateRequest):
+    # 静态审计：与 /negotiate 相同的校验与匹配语义，但不返回单一选定项。
+    invalid = _validate_candidates(payload)
+    if invalid is not None:
+        return invalid
+
+    raw_candidates = [(c.media_type, c.server_priority) for c in payload.candidates]
+    try:
+        audits, shadowed, accept_ranges = audit_accept(payload.accept, raw_candidates)
+    except AcceptSyntaxError as exc:
+        return _bad_request(str(exc))
+
+    body = {
+        "candidates": [a.to_dict() for a in audits],
+        "shadowed": [_accept_to_dict(r) for r in shadowed],
+        "parsed_accept": [_accept_to_dict(r) for r in accept_ranges],
+    }
+
+    if not any(a.eligible for a in audits):
+        # 与 /negotiate 一致：无可用候选（全部 q=0 或无命中）时返回 406，
+        # 响应体仍带完整审计明细。
+        return JSONResponse(
+            status_code=406,
+            content={
+                "error": "not_acceptable",
+                "detail": "没有可接受的候选表示",
+                **body,
+            },
+        )
+    return body

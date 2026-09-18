@@ -135,6 +135,15 @@ def parse_accept(header: str) -> list[AcceptRange]:
 SPECIFICITY_NAMES = {0: "wildcard", 1: "type_subtype_wildcard", 2: "exact"}
 
 
+def _matching_ranges(
+    accept_ranges: list[AcceptRange], media_type: str, subtype: str
+) -> list[AcceptRange]:
+    """命中某候选的全部范围：具体度降序，同具体度按头部位置升序。"""
+    hits = [r for r in accept_ranges if r.matches(media_type, subtype)]
+    hits.sort(key=lambda r: (-r.specificity, r.index))
+    return hits
+
+
 @dataclass
 class CandidateResult:
     index: int
@@ -182,8 +191,7 @@ def negotiate(
         mtype, msub = media_type.split("/", 1)
 
         # 所有命中的范围；先按具体度降序，同具体度按头中位置取最早。
-        hits = [r for r in accept_ranges if r.matches(mtype, msub)]
-        hits.sort(key=lambda r: (-r.specificity, r.index))
+        hits = _matching_ranges(accept_ranges, mtype, msub)
 
         if not hits:
             results.append(
@@ -249,3 +257,172 @@ def negotiate(
         if r.eligible and r.index != selected:
             r.eliminated_reason = "outranked"
     return selected, results, accept_ranges
+
+
+# ---------- 静态审计（不做最终选定） ----------
+
+
+@dataclass
+class RangeHitView:
+    """审计视图：候选命中的某个范围（按头部顺序列出）。"""
+
+    index: int
+    range: str
+    q: float
+    specificity: int
+    specificity_name: str
+    effective: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "range": self.range,
+            "q": self.q,
+            "specificity": self.specificity,
+            "specificity_name": self.specificity_name,
+            "effective": self.effective,
+        }
+
+
+@dataclass
+class RangeConflictView:
+    """同一候选上具体度相同但 q 不同的一组冲突范围。"""
+
+    specificity: int
+    specificity_name: str
+    ranges: list[dict]
+
+    def to_dict(self) -> dict:
+        return {
+            "specificity": self.specificity,
+            "specificity_name": self.specificity_name,
+            "ranges": self.ranges,
+        }
+
+
+@dataclass
+class CandidateAudit:
+    """单个候选的静态审计结果。"""
+
+    index: int
+    media_type: str
+    server_priority: float
+    eligible: bool
+    eliminated_reason: str | None
+    effective_range: dict | None
+    matched_ranges: list[RangeHitView]
+    conflicts: list[RangeConflictView]
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "media_type": self.media_type,
+            "server_priority": self.server_priority,
+            "eligible": self.eligible,
+            "eliminated_reason": self.eliminated_reason,
+            "effective_range": self.effective_range,
+            "matched_ranges": [h.to_dict() for h in self.matched_ranges],
+            "conflicts": [c.to_dict() for c in self.conflicts],
+        }
+
+
+def _range_brief(r: AcceptRange) -> dict:
+    return {
+        "index": r.index,
+        "range": r.raw,
+        "q": r.q,
+        "specificity": r.specificity,
+        "specificity_name": SPECIFICITY_NAMES[r.specificity],
+    }
+
+
+def _find_conflicts(hits: list[AcceptRange]) -> list[RangeConflictView]:
+    """按具体度分组，同组内 q 取值不唯一即构成冲突。
+
+    组内范围按头部位置升序；组间按组内最早头部位置排序，保证输出稳定。
+    """
+    by_specificity: dict[int, list[AcceptRange]] = {}
+    for r in hits:
+        by_specificity.setdefault(r.specificity, []).append(r)
+
+    conflicts: list[RangeConflictView] = []
+    for specificity, group in by_specificity.items():
+        if len({r.q for r in group}) < 2:
+            continue
+        ordered = sorted(group, key=lambda r: r.index)
+        conflicts.append(
+            RangeConflictView(
+                specificity=specificity,
+                specificity_name=SPECIFICITY_NAMES[specificity],
+                ranges=[
+                    {"index": r.index, "range": r.raw, "q": r.q} for r in ordered
+                ],
+            )
+        )
+    conflicts.sort(key=lambda c: c.ranges[0]["index"])
+    return conflicts
+
+
+def audit_accept(
+    accept_header: str,
+    candidates: list[tuple[str, float]],
+) -> tuple[list[CandidateAudit], list[AcceptRange], list[AcceptRange]]:
+    """对协商规则做静态审计，不返回单一选定项。
+
+    返回 (每个候选的审计结果, shadowed 范围, 解析后的 Accept 范围)。
+
+    - 每个候选列出全部命中范围（按头部顺序）及最终生效范围（与协商规则一致：
+      最具体优先，同具体度取头中最早）；
+    - shadowed：合法但从未对任何候选生效的范围，按头部顺序排列；
+    - q=0 排除与无命中语义与 negotiate 一致（但不产生 outranked）。
+    """
+    accept_ranges = parse_accept(accept_header)
+
+    audits: list[CandidateAudit] = []
+    effective_indices: set[int] = set()
+
+    for index, (raw_media_type, server_priority) in enumerate(candidates):
+        media_type = raw_media_type.strip().lower()
+        validate_concrete_media_type(media_type)
+        mtype, msub = media_type.split("/", 1)
+
+        hits = _matching_ranges(accept_ranges, mtype, msub)
+        best = hits[0] if hits else None
+
+        if best is None:
+            eligible, reason = False, "no_match"
+        elif best.q == 0:
+            eligible, reason = False, "q_zero"
+        else:
+            eligible, reason = True, None
+
+        if best is not None:
+            effective_indices.add(best.index)
+
+        matched = [
+            RangeHitView(
+                index=r.index,
+                range=r.raw,
+                q=r.q,
+                specificity=r.specificity,
+                specificity_name=SPECIFICITY_NAMES[r.specificity],
+                effective=(best is not None and r.index == best.index),
+            )
+            for r in sorted(hits, key=lambda r: r.index)
+        ]
+
+        audits.append(
+            CandidateAudit(
+                index=index,
+                media_type=media_type,
+                server_priority=server_priority,
+                eligible=eligible,
+                eliminated_reason=reason,
+                effective_range=_range_brief(best) if best is not None else None,
+                matched_ranges=matched,
+                conflicts=_find_conflicts(hits),
+            )
+        )
+
+    shadowed = [r for r in accept_ranges if r.index not in effective_indices]
+    return audits, shadowed, accept_ranges
