@@ -5,6 +5,10 @@
 服务返回最终选定的表示，以及**每个候选命中的范围、q 值、匹配具体度和淘汰原因**，
 方便直观地理解协商全过程。
 
+另有 `POST /audit-accept` 端点做**静态审计**：不返回单一选定项，而是列出每个
+候选命中的全部范围与最终生效范围、从未生效的 shadowed 范围，以及同具体度
+q 值冲突。
+
 ## 一条命令启动
 
 ```bash
@@ -114,6 +118,109 @@ curl -i -X POST http://localhost:8000/negotiate \
   -H 'Content-Type: application/json' \
   -d '{"accept":"*/*;q=0","candidates":[{"media_type":"text/html","server_priority":0}]}'
 ```
+
+### `POST /audit-accept`
+
+请求体与 `POST /negotiate` 完全相同（`accept` + `candidates`），但只做**静态
+审计**，不做跨候选排序、**不返回 `selected`**。输出稳定：候选按输入顺序，
+每个候选的命中范围按**具体度降序、同具体度按头部索引升序**，`shadowed` 与
+`parsed_accept` 按头部索引顺序。
+
+#### 审计规则
+
+1. `candidates[].hits`：该候选命中的**所有**合法范围（即使被更具体范围遮蔽也
+   列出），每条携带头部 `index`、`q`、`specificity`；
+2. `candidates[].effective`：**最终生效范围**，即命中范围中最具体、同具体度
+   最早出现者（与 `/negotiate` 的 `matched_range` 完全一致）；无命中时为
+   `null`；
+3. `candidates[].conflicts`：**同一候选上具体度相同但 q 不同**的范围组，每组
+   按头部索引升序列出冲突范围及其头部索引；q 相同的重复范围不算冲突；
+4. `shadowed`：**从未对任何候选生效**的合法范围（按头部索引升序）。注意
+   `q=0` 的范围若成为某候选的生效范围，不算 shadowed；
+5. 语义与 `/negotiate` 保持一致：
+   - 生效范围 `q=0` → `eligible: false`、`eliminated_reason: "q_zero"`；
+   - 无任何命中 → `hits: []`、`effective: null`、`eliminated_reason: "no_match"`；
+   - 审计不做跨候选选择，因此**不会出现 `outranked`**；
+   - 当没有任何 `eligible` 候选时，返回与 `/negotiate` 相同的 **406** 格式
+     （响应体仍包含完整审计明细）；
+   - 任一输入非法（Accept 语法、候选类型、空候选列表、请求体格式）返回与
+     `/negotiate` 相同的 **400** 格式。
+
+#### 200 响应示例
+
+```bash
+curl -s -X POST http://localhost:8000/audit-accept \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "accept": "application/json;q=0.3, application/json;q=0.9, application/*;q=0.5, */*;q=0.1",
+    "candidates": [
+      {"media_type": "application/json", "server_priority": 1},
+      {"media_type": "text/html", "server_priority": 5}
+    ]
+  }'
+```
+
+```json
+{
+  "candidates": [
+    {
+      "index": 0,
+      "media_type": "application/json",
+      "server_priority": 1.0,
+      "hits": [
+        {"index": 0, "range": "application/json", "q": 0.3,
+         "specificity": 2, "specificity_name": "exact"},
+        {"index": 1, "range": "application/json", "q": 0.9,
+         "specificity": 2, "specificity_name": "exact"},
+        {"index": 2, "range": "application/*", "q": 0.5,
+         "specificity": 1, "specificity_name": "type_subtype_wildcard"},
+        {"index": 3, "range": "*/*", "q": 0.1,
+         "specificity": 0, "specificity_name": "wildcard"}
+      ],
+      "effective": {"index": 0, "range": "application/json", "q": 0.3,
+                    "specificity": 2, "specificity_name": "exact"},
+      "eligible": true,
+      "eliminated_reason": null,
+      "conflicts": [
+        {"specificity": 2, "specificity_name": "exact",
+         "ranges": [
+           {"index": 0, "range": "application/json", "q": 0.3,
+            "specificity": 2, "specificity_name": "exact"},
+           {"index": 1, "range": "application/json", "q": 0.9,
+            "specificity": 2, "specificity_name": "exact"}
+         ]}
+      ]
+    },
+    {
+      "index": 1,
+      "media_type": "text/html",
+      "server_priority": 5.0,
+      "hits": [
+        {"index": 3, "range": "*/*", "q": 0.1,
+         "specificity": 0, "specificity_name": "wildcard"}
+      ],
+      "effective": {"index": 3, "range": "*/*", "q": 0.1,
+                    "specificity": 0, "specificity_name": "wildcard"},
+      "eligible": true,
+      "eliminated_reason": null,
+      "conflicts": []
+    }
+  ],
+  "shadowed": [
+    {"index": 1, "range": "application/json", "q": 0.9,
+     "specificity": 2, "specificity_name": "exact"},
+    {"index": 2, "range": "application/*", "q": 0.5,
+     "specificity": 1, "specificity_name": "type_subtype_wildcard"}
+  ],
+  "parsed_accept": [
+    {"index": 0, "range": "application/json", "q": 0.3, "specificity": 2, "specificity_name": "exact"}
+  ]
+}
+```
+
+上例中：两条精确范围 `application/json`（头部索引 0、1）具体度相同但 q 不同，
+构成冲突并按头部索引报告；头部索引 1 的重复精确范围与 `application/*`
+（索引 2）从未对任何候选生效，进入 `shadowed`。
 
 ## 本地开发（不使用容器）
 

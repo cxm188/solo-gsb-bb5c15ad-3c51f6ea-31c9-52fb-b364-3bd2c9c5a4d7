@@ -15,6 +15,8 @@ from .negotiation import (
     AcceptSyntaxError,
     AcceptRange,
     SPECIFICITY_NAMES,
+    accept_range_to_dict,
+    audit,
     negotiate,
 )
 
@@ -68,6 +70,37 @@ class NegotiateResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     detail: str
+
+
+class AuditRange(BaseModel):
+    index: int
+    range: str
+    q: float
+    specificity: int
+    specificity_name: str
+
+
+class RangeConflictOut(BaseModel):
+    specificity: int
+    specificity_name: str
+    ranges: list[AuditRange]
+
+
+class CandidateAuditOut(BaseModel):
+    index: int
+    media_type: str
+    server_priority: float
+    hits: list[AuditRange]
+    effective: AuditRange | None
+    eligible: bool
+    eliminated_reason: str | None
+    conflicts: list[RangeConflictOut]
+
+
+class AuditResponse(BaseModel):
+    candidates: list[CandidateAuditOut]
+    shadowed: list[AuditRange]
+    parsed_accept: list[AuditRange]
 
 
 def _bad_request(message: str) -> JSONResponse:
@@ -164,3 +197,46 @@ async def do_negotiate(payload: NegotiateRequest):
         "candidates": candidate_payload,
         "parsed_accept": [_accept_to_dict(r) for r in accept_ranges],
     }
+
+
+@app.post(
+    "/audit-accept",
+    response_model=AuditResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Accept 头或候选非法"},
+        406: {"model": ErrorResponse, "description": "无可用候选表示"},
+    },
+)
+async def do_audit(payload: NegotiateRequest):
+    # 与 /negotiate 相同的输入校验：候选列表不能为空，server_priority 必须为有限数。
+    if not payload.candidates:
+        return _bad_request("candidates 不能为空")
+    for i, cand in enumerate(payload.candidates):
+        if not math.isfinite(cand.server_priority):
+            return _bad_request(f"candidates[{i}].server_priority 必须是有限数")
+
+    raw_candidates = [(c.media_type, c.server_priority) for c in payload.candidates]
+    try:
+        audits, accept_ranges, shadowed = audit(payload.accept, raw_candidates)
+    except AcceptSyntaxError as exc:
+        return _bad_request(str(exc))
+
+    body = {
+        "candidates": [a.to_dict() for a in audits],
+        "shadowed": [accept_range_to_dict(r) for r in shadowed],
+        "parsed_accept": [accept_range_to_dict(r) for r in accept_ranges],
+    }
+
+    # 静态审计不返回单一选定项；但 q=0/无命中语义保留：
+    # 没有任何可用候选时仍按现有 406 格式返回。
+    if not any(a.eligible for a in audits):
+        return JSONResponse(
+            status_code=406,
+            content={
+                "error": "not_acceptable",
+                "detail": "没有可接受的候选表示",
+                **body,
+            },
+        )
+
+    return body

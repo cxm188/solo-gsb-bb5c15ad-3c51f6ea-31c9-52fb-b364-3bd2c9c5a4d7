@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from itertools import groupby
 
 # RFC 9110 tchar 字符集，但去掉单独的 "*"（通配符只能作为完整的一段）。
 _TOKEN = r"[!#$%&'+\-.^_`|~0-9A-Za-z]+"
@@ -249,3 +250,140 @@ def negotiate(
         if r.eligible and r.index != selected:
             r.eliminated_reason = "outranked"
     return selected, results, accept_ranges
+
+
+@dataclass(frozen=True)
+class RangeConflict:
+    """同一候选上具体度相同但 q 不同的一组范围。"""
+
+    specificity: int
+    specificity_name: str
+    # 冲突涉及的范围，按头中索引升序（即 (specificity 降序, index 升序) 组内顺序）。
+    ranges: list[AcceptRange]
+
+
+@dataclass(frozen=True)
+class CandidateAudit:
+    """单个候选的静态审计结果。"""
+
+    index: int
+    media_type: str
+    server_priority: float
+    # 所有命中范围，按具体度降序、同具体度按头中索引升序。
+    hits: list[AcceptRange]
+    # 最终生效范围（最具体且最早出现）；无命中时为 None。
+    effective: AcceptRange | None
+    eligible: bool
+    eliminated_reason: str | None
+    # 同具体度但 q 不同的冲突范围组，按具体度降序。
+    conflicts: list[RangeConflict]
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "media_type": self.media_type,
+            "server_priority": self.server_priority,
+            "hits": [accept_range_to_dict(r) for r in self.hits],
+            "effective": (
+                accept_range_to_dict(self.effective)
+                if self.effective is not None
+                else None
+            ),
+            "eligible": self.eligible,
+            "eliminated_reason": self.eliminated_reason,
+            "conflicts": [
+                {
+                    "specificity": c.specificity,
+                    "specificity_name": c.specificity_name,
+                    "ranges": [accept_range_to_dict(r) for r in c.ranges],
+                }
+                for c in self.conflicts
+            ],
+        }
+
+
+def accept_range_to_dict(r: AcceptRange) -> dict:
+    return {
+        "index": r.index,
+        "range": r.raw,
+        "q": r.q,
+        "specificity": r.specificity,
+        "specificity_name": SPECIFICITY_NAMES[r.specificity],
+    }
+
+
+def _find_conflicts(hits: list[AcceptRange]) -> list[RangeConflict]:
+    """在命中范围中找出同具体度但 q 不同的范围组（携带头中索引）。"""
+    conflicts: list[RangeConflict] = []
+    # hits 已按 (-specificity, index) 排序，同具体度范围天然相邻。
+    for specificity, group_iter in groupby(hits, key=lambda r: r.specificity):
+        group = list(group_iter)
+        if len(group) > 1 and len({g.q for g in group}) > 1:
+            conflicts.append(
+                RangeConflict(
+                    specificity=specificity,
+                    specificity_name=SPECIFICITY_NAMES[specificity],
+                    ranges=group,
+                )
+            )
+    return conflicts
+
+
+def audit(
+    accept_header: str,
+    candidates: list[tuple[str, float]],
+) -> tuple[list[CandidateAudit], list[AcceptRange], list[AcceptRange]]:
+    """对协商规则做静态审计，不做跨候选选择。
+
+    返回 (按输入顺序的候选审计, 解析后的 Accept 范围, shadowed 范围)。
+
+    对每个候选列出所有命中范围（具体度降序、同具体度按头中索引升序）与最终
+    生效范围；同候选上具体度相同但 q 不同的范围记为冲突。从未对任何候选生效
+    的合法范围汇总为 shadowed（按头中索引升序）。
+
+    语义与 negotiate 一致：无命中为 no_match，生效范围 q=0 为 q_zero，其余为
+    eligible；本函数不产生 outranked（审计不做跨候选排序）。
+    """
+    accept_ranges = parse_accept(accept_header)
+
+    audits: list[CandidateAudit] = []
+    effective_indices: set[int] = set()
+    for index, (raw_media_type, server_priority) in enumerate(candidates):
+        media_type = raw_media_type.strip().lower()
+        validate_concrete_media_type(media_type)
+        mtype, msub = media_type.split("/", 1)
+
+        # 所有命中的范围；先按具体度降序，同具体度按头中位置取最早。
+        hits = [r for r in accept_ranges if r.matches(mtype, msub)]
+        hits.sort(key=lambda r: (-r.specificity, r.index))
+
+        if not hits:
+            effective = None
+            eligible = False
+            eliminated_reason = "no_match"
+        else:
+            effective = hits[0]
+            effective_indices.add(effective.index)
+            if effective.q == 0:
+                eligible = False
+                eliminated_reason = "q_zero"
+            else:
+                eligible = True
+                eliminated_reason = None
+
+        audits.append(
+            CandidateAudit(
+                index=index,
+                media_type=media_type,
+                server_priority=server_priority,
+                hits=hits,
+                effective=effective,
+                eligible=eligible,
+                eliminated_reason=eliminated_reason,
+                conflicts=_find_conflicts(hits),
+            )
+        )
+
+    # 从未对任何候选生效（q=0 生效也算生效）的合法范围。
+    shadowed = [r for r in accept_ranges if r.index not in effective_indices]
+    return audits, accept_ranges, shadowed
